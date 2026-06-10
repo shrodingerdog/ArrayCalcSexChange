@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+import vs
+import uuid
+import os
+import math
+import random
+from datetime import datetime
+from xml.sax.saxutils import escape
+
+AUTHOR_NAME = 'Custom Vectorworks Exporter'
+COMMENTS = 'Exported from Vectorworks 3D Polygon Tool to ArrayCalc .dbacv'
+
+DEFAULT_LISTENER_HEIGHT = 1.7
+PLANE_TYPE = 1  # Listening
+
+DEFAULT_PRINT_COLOR = 4294945280
+
+TYPE_3D_POLYGON = 25
+UNIT_SCALE = 0.001
+EXPORT_DIR = r'C:\AC Exp'
+MAX_COORD = 1.0e12
+EPS_3D = 1e-9
+AREA_EPS = 1e-16
+
+collected = []
+skipped = []
+
+g_listener_height = DEFAULT_LISTENER_HEIGHT
+g_export_stamp = ''
+
+selected_total = 0
+selected_3d_polygons = 0
+skipped_total = 0
+triangles_built = 0
+triangles_exported = 0
+polygon_index = 0
+
+def fmt(v):
+    return '{:.15g}'.format(v)
+
+def sanitize_object_name(name):
+    if name is None:
+        return 'Plane'
+
+    out = str(name).strip()
+    if out == '':
+        return 'Plane'
+
+    if out.lower() in ['none', 'nil', '<none>']:
+        return 'Plane'
+
+    bad = ['\\', '/', ':', '*', '?', '"', '<', '>', '|']
+    for ch in bad:
+        out = out.replace(ch, '_')
+
+    out = out.strip()
+    if out == '':
+        return 'Plane'
+
+    return out
+
+def parse_height(text):
+    try:
+        t = text.strip().replace(',', '.')
+        return float(t)
+    except:
+        return DEFAULT_LISTENER_HEIGHT
+
+def ensure_export_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path)
+
+def build_export_path():
+    ensure_export_dir(EXPORT_DIR)
+
+    base_name = 'Plane_{}'.format(g_export_stamp)
+    file_name = base_name + '.dbacv'
+    full_path = os.path.join(EXPORT_DIR, file_name)
+
+    if not os.path.exists(full_path):
+        return full_path
+
+    index = 1
+    while True:
+        file_name = '{}_{:03d}.dbacv'.format(base_name, index)
+        full_path = os.path.join(EXPORT_DIR, file_name)
+        if not os.path.exists(full_path):
+            return full_path
+        index += 1
+
+def map_point_vw_to_ac(x, y, z):
+    return (x * UNIT_SCALE, y * UNIT_SCALE, z * UNIT_SCALE)
+
+def is_finite_number(v):
+    try:
+        return math.isfinite(v)
+    except:
+        return False
+
+def is_reasonable_point(p):
+    return (
+        is_finite_number(p[0]) and
+        is_finite_number(p[1]) and
+        is_finite_number(p[2]) and
+        abs(p[0]) <= MAX_COORD and
+        abs(p[1]) <= MAX_COORD and
+        abs(p[2]) <= MAX_COORD
+    )
+
+def pt_equal(a, b, eps=EPS_3D):
+    return abs(a[0]-b[0]) <= eps and abs(a[1]-b[1]) <= eps and abs(a[2]-b[2]) <= eps
+
+def v_sub(a, b):
+    return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
+
+def v_cross(a, b):
+    return (
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0]
+    )
+
+def v_len(v):
+    return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+
+def triangle_area2_3d(a, b, c):
+    return v_len(v_cross(v_sub(b, a), v_sub(c, a)))
+
+def get_name(h):
+    try:
+        n = vs.GetName(h)
+    except:
+        n = ''
+    return sanitize_object_name(n)
+
+def get_points_3dpoly_raw(h):
+    pts = []
+    count = vs.GetVertNum(h)
+    for i in range(count):
+        x, y, z = vs.GetPolyPt3D(h, i)
+        pts.append(map_point_vw_to_ac(x, y, z))
+    return pts
+
+def clean_points_minimal(pts):
+    if not pts:
+        return []
+
+    out = []
+    for p in pts:
+        if not is_reasonable_point(p):
+            continue
+        if len(out) == 0 or not pt_equal(p, out[-1]):
+            out.append(p)
+
+    if len(out) > 2 and pt_equal(out[0], out[-1]):
+        out.pop()
+
+    return out
+
+def triangulate_fan_3d(pts):
+    tris = []
+    if len(pts) < 3:
+        return tris
+
+    p0 = pts[0]
+    for i in range(1, len(pts) - 1):
+        p1 = pts[i]
+        p2 = pts[i + 1]
+
+        if not (is_reasonable_point(p0) and is_reasonable_point(p1) and is_reasonable_point(p2)):
+            continue
+        if pt_equal(p0, p1) or pt_equal(p1, p2) or pt_equal(p0, p2):
+            continue
+        if triangle_area2_3d(p0, p1, p2) <= AREA_EPS:
+            continue
+
+        tris.append((p0, p1, p2))
+
+    return tris
+
+def random_argb_color():
+    r = random.randint(60, 220)
+    g = random.randint(60, 220)
+    b = random.randint(60, 220)
+    a = 255
+    return (a << 24) | (r << 16) | (g << 8) | b
+
+def triangle_to_xml(name, tri, color_value, order_index):
+    p1w, p2w, p3w = tri
+
+    origin = p1w
+    p1 = (0.0, 0.0, 0.0)
+    p2 = v_sub(p2w, origin)
+    p3 = v_sub(p3w, origin)
+
+    return '''        <RoomObject Shape="6" PlaneType="{plane_type}" Name="{name}" Enabled="1" Transparent="1" Locked="0" ListenerHeight="{lh}" Color="{color}" PrintColor="{pcolor}" ParentVenueObjectId="0" OrderIndex="{order}">
+            <Origin x="{ox}" y="{oy}" z="{oz}"/>
+            <Rotation/>
+            <Scaling x="1" y="1" z="1"/>
+            <P1 x="{p1x}" y="{p1y}" z="{p1z}"/>
+            <P2 x="{p2x}" y="{p2y}" z="{p2z}"/>
+            <P3 x="{p3x}" y="{p3y}" z="{p3z}"/>
+        </RoomObject>'''.format(
+        plane_type=PLANE_TYPE,
+        name=escape(name),
+        lh=fmt(g_listener_height),
+        color=color_value,
+        pcolor=DEFAULT_PRINT_COLOR,
+        order=order_index,
+        ox=fmt(origin[0]), oy=fmt(origin[1]), oz=fmt(origin[2]),
+        p1x=fmt(p1[0]), p1y=fmt(p1[1]), p1z=fmt(p1[2]),
+        p2x=fmt(p2[0]), p2y=fmt(p2[1]), p2z=fmt(p2[2]),
+        p3x=fmt(p3[0]), p3y=fmt(p3[1]), p3z=fmt(p3[2])
+    )
+
+def build_dbacv(triangles):
+    room_objects = []
+    order = 1
+
+    for item in triangles:
+        room_objects.append(
+            triangle_to_xml(
+                item['name'],
+                item['triangle'],
+                item['color'],
+                order
+            )
+        )
+        order += 1
+
+    return '''<!DOCTYPE ArrayCalc>
+<ArrayCalc Version="10.10.1">
+    <Project Name="d&amp;b ArrayCalc Exchange">
+        <Date>{date}</Date>
+        <Author>{author}</Author>
+        <Comments>
+            {comments}
+        </Comments>
+    </Project>
+    <Venue Version="9">
+{room_objects}
+    </Venue>
+</ArrayCalc>
+'''.format(
+        date=vs.Date(2, 0),
+        author=escape(AUTHOR_NAME),
+        comments=escape(COMMENTS + ' | Export stamp: ' + g_export_stamp),
+        room_objects='\n'.join(room_objects)
+    )
+
+def write_text_file(path, content):
+    folder = os.path.dirname(path)
+    ensure_export_dir(folder)
+
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(content)
+
+    return path
+
+def ask_listener_height():
+    global g_listener_height
+
+    value = vs.StrDialog('Listening Height', str(DEFAULT_LISTENER_HEIGHT))
+    if value is None:
+        return False
+
+    g_listener_height = parse_height(value)
+    if g_listener_height <= 0:
+        g_listener_height = DEFAULT_LISTENER_HEIGHT
+
+    return True
+
+def count_selected_object(h):
+    global selected_total
+    selected_total += 1
+
+def process_object(h):
+    global selected_3d_polygons, skipped_total, triangles_built, polygon_index, g_export_stamp
+
+    if vs.GetTypeN(h) != TYPE_3D_POLYGON:
+        skipped.append('{}: not 3D Polygon'.format(get_name(h)))
+        skipped_total += 1
+        return
+
+    selected_3d_polygons += 1
+    polygon_index += 1
+
+    source_name = '{}_{}'.format(g_export_stamp, polygon_index)
+    polygon_color = random_argb_color()
+
+    raw_pts = get_points_3dpoly_raw(h)
+    pts = clean_points_minimal(raw_pts)
+
+    if len(pts) < 3:
+        skipped.append('{}: less than 3 valid vertices'.format(source_name))
+        skipped_total += 1
+        return
+
+    expected = max(0, len(pts) - 2)
+    tris = triangulate_fan_3d(pts)
+
+    if len(tris) == 0:
+        skipped.append('{}: triangulation failed (0 of {})'.format(source_name, expected))
+        skipped_total += 1
+        return
+
+    if len(tris) != expected:
+        skipped.append('{}: triangulation partial ({} of {})'.format(source_name, len(tris), expected))
+
+    triangles_built += len(tris)
+
+    for i, tri in enumerate(tris, 1):
+        tri_name = '{}_{}'.format(source_name, i)
+
+        collected.append({
+            'name': tri_name,
+            'triangle': tri,
+            'color': polygon_color
+        })
+
+def main():
+    global collected, skipped, g_export_stamp
+    global selected_total, selected_3d_polygons, skipped_total
+    global triangles_built, triangles_exported, polygon_index
+
+    collected = []
+    skipped = []
+
+    selected_total = 0
+    selected_3d_polygons = 0
+    skipped_total = 0
+    triangles_built = 0
+    triangles_exported = 0
+    polygon_index = 0
+
+    g_export_stamp = datetime.now().strftime('%H%M%S')
+
+    if not ask_listener_height():
+        return
+
+    vs.ForEachObject(count_selected_object, "(SEL=TRUE)")
+    vs.ForEachObject(process_object, "(SEL=TRUE)")
+
+    if selected_total == 0:
+        vs.AlrtDialog('No objects selected.')
+        return
+
+    if len(collected) == 0:
+        msg = 'No data to export.'
+        msg += '\nSelected objects: {}'.format(selected_total)
+        msg += '\n3D polygons: {}'.format(selected_3d_polygons)
+        msg += '\nSkipped objects: {}'.format(skipped_total)
+        msg += '\nTriangles built: {}'.format(triangles_built)
+        msg += '\nTriangles exported: 0'
+        if skipped:
+            msg += '\n\nSkipped:\n' + '\n'.join(skipped[:20])
+        vs.AlrtDialog(msg)
+        return
+
+    save_path = build_export_path()
+    xml = build_dbacv(collected)
+    write_text_file(save_path, xml)
+
+    triangles_exported = len(collected)
+
+    msg = 'Export complete.'
+    msg += '\nFile: {}'.format(save_path)
+    msg += '\nSelected objects: {}'.format(selected_total)
+    msg += '\n3D polygons: {}'.format(selected_3d_polygons)
+    msg += '\nSkipped objects: {}'.format(skipped_total)
+    msg += '\nTriangles built: {}'.format(triangles_built)
+    msg += '\nTriangles exported: {}'.format(triangles_exported)
+    msg += '\nListening Height: {}'.format(g_listener_height)
+    msg += '\nExport stamp: {}'.format(g_export_stamp)
+
+    if skipped:
+        msg += '\n\nSkipped:\n' + '\n'.join(skipped[:20])
+
+    vs.AlrtDialog(msg)
+
+main()
